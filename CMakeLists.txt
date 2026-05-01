@@ -10,6 +10,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
 
 add_library(kv_core 
     src/core/store.cpp
+    src/core/wal.cpp
 )
 
 target_include_directories(kv_core PUBLIC 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "kvstore/wal.hpp"
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -10,7 +12,7 @@ namespace kvstore {
 
 class KVStore {
 public:
-  KVStore() = default;
+  explicit KVStore(const std::string &directory);
   ~KVStore() = default;
 
   // delete copy/move constructors
@@ -32,6 +34,8 @@ private:
   std::unordered_map<std::string, std::string> store_;
   // shared mutex for shared reading and exclusive writes
   mutable std::shared_mutex rw_mutex_;
+  // write ahead log
+  std::unique_ptr<WriteAheadLog> wal_;
 };
 
 } // namespace kvstore
