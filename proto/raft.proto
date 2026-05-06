@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package raftpb;
+
+message RequestVoteArgs {
+  int32 term = 1;         // candidate's current term
+  int32 candidateId = 2;  // candidate requesting vote
+  int32 lastLogIndex = 3; // index of candidate's last log entry
+  int32 lastLogTerm = 4;  // term of candidate's last log entry
+}
+
+message RequestVoteReply {
+  int32 term = 1; // current term, for candidate to update itself
+  bool voteGranted = 2;
+}
+
+message LogEntry {
+  int32 term = 1; // term when this entry was received by the leader
+  string command = 2;
+}
+
+message AppendEntriesArgs {
+  int32 term = 1;
+  int32 leaderId = 2;
+  int32 prevLogIndex = 3;
+  int32 prevLogTerm = 4;
+  repeated LogEntry entries = 5; // log entries to store
+  int32 leaderCommit = 6;        // leader's commitIndex
+}
+
+message AppendEntriesReply {
+  int32 term = 1;
+  bool success = 2;
+}
+
+service RaftNode {
+  rpc RequestVote(RequestVoteArgs) returns (RequestVoteReply);
+  rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesReply);
+}
