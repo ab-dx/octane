@@ -33,7 +33,16 @@ message AppendEntriesReply {
   bool success = 2;
 }
 
+message ClientRequest { string command = 1; }
+
+message ClientReply {
+  bool success = 1;
+  string leaderHint = 2; // if sent to a follower, mention the leader
+  string value = 3;
+}
+
 service RaftNode {
   rpc RequestVote(RequestVoteArgs) returns (RequestVoteReply);
   rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesReply);
+  rpc SubmitCommand(ClientRequest) returns (ClientReply);
 }

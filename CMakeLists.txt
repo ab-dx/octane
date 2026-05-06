@@ -43,3 +43,6 @@ target_link_libraries(kv_core PUBLIC Threads::Threads raft_proto)
 
 add_executable(kv_server src/server/main.cpp)
 target_link_libraries(kv_server PRIVATE kv_core)
+
+add_executable(kv_client src/client/client.cpp)
+target_link_libraries(kv_client PRIVATE raft_proto) 

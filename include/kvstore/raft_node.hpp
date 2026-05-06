@@ -35,6 +35,10 @@ public:
                              const raftpb::AppendEntriesArgs *request,
                              raftpb::AppendEntriesReply *reply) override;
 
+  grpc::Status SubmitCommand(grpc::ServerContext *context,
+                             const raftpb::ClientRequest *request,
+                             raftpb::ClientReply *reply) override;
+
 private:
   KVStore &store_;
 
@@ -54,10 +58,21 @@ private:
   std::atomic<bool> running_;
   std::thread background_thread_;
 
+  // raft log
+  std::vector<raftpb::LogEntry> log_;
+  int commit_index_ = 0; // index of highest log entry known to be committed
+  int last_applied_ = 0;
+
+  // track the next log index to send to each peer
+  std::unordered_map<int, int> next_index_;
+  // track the highest log index known to be replicated on each peer
+  std::unordered_map<int, int> match_index_;
+
   void ElectionLoop();
   void BecomeFollower(int new_term);
   void StartElection();
   void SendHeartbeats();
+  void ApplyCommittedEntries();
 };
 
 } // namespace kvstore

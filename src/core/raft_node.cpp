@@ -122,6 +122,13 @@ void RaftNode::StartElection() {
           std::lock_guard<std::mutex> lock(state_mutex_);
           if (state_ == NodeState::CANDIDATE) {
             state_ = NodeState::LEADER;
+
+            for (const auto &p : peers_) {
+              // next index to send is right after current log end
+              next_index_[p.id] = log_.size();
+              match_index_[p.id] = -1; // nothing replicated yet
+            }
+
             std::cout << "NODE " << node_id_ << " IS THE NEW LEADER FOR TERM "
                       << current_term_ << "\n";
             // start sending heartbeats
@@ -142,13 +149,73 @@ void RaftNode::SendHeartbeats() {
       context.set_deadline(std::chrono::system_clock::now() +
                            std::chrono::milliseconds(50));
 
+      int peer_next_idx;
+
       {
         std::lock_guard<std::mutex> lock(state_mutex_);
+        if (state_ != NodeState::LEADER)
+          return; // exit if not leader
+
         args.set_term(current_term_);
         args.set_leaderid(node_id_);
+        args.set_leadercommit(commit_index_);
+
+        peer_next_idx = next_index_[peer.id];
+        int prev_log_index = peer_next_idx - 1;
+
+        // calculate previous term
+        int prev_log_term =
+            (prev_log_index >= 0 && prev_log_index < log_.size())
+                ? log_[prev_log_index].term()
+                : 0;
+
+        args.set_prevlogindex(prev_log_index);
+        args.set_prevlogterm(prev_log_term);
+
+        // add any missing entries to the RPC
+        for (size_t i = peer_next_idx; i < log_.size(); ++i) {
+          *args.add_entries() = log_[i];
+        }
       }
 
-      peer.stub->AppendEntries(&context, args, &reply);
+      grpc::Status status = peer.stub->AppendEntries(&context, args, &reply);
+
+      if (status.ok()) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (state_ != NodeState::LEADER || current_term_ != args.term())
+          return;
+
+        if (reply.term() > current_term_) {
+          BecomeFollower(reply.term());
+          return;
+        }
+
+        if (reply.success()) {
+          match_index_[peer.id] = args.prevlogindex() + args.entries_size();
+          next_index_[peer.id] = match_index_[peer.id] + 1;
+
+          // commit a new entry if a majority replicated
+          for (int n = log_.size() - 1; n > commit_index_; --n) {
+            if (log_[n].term() == current_term_) {
+              int match_count = 1;
+              for (const auto &p : peers_) {
+                if (match_index_[p.id] >= n)
+                  match_count++;
+              }
+
+              int majority = (peers_.size() + 1) / 2 + 1;
+              if (match_count >= majority) {
+                commit_index_ = n;       // move the commit line forward
+                ApplyCommittedEntries(); // apply to store
+                break;
+              }
+            }
+          }
+        } else {
+          // decrement next_index and retry with older logs next heartbeat
+          next_index_[peer.id] = std::max(0, next_index_[peer.id] - 1);
+        }
+      }
     }).detach();
   }
 }
@@ -197,15 +264,125 @@ grpc::Status RaftNode::AppendEntries(grpc::ServerContext *context,
     return grpc::Status::OK;
   }
 
-  // acknowledge the leader
+  // acknowledge leader
   BecomeFollower(request->term());
-
   last_heartbeat_ = std::chrono::steady_clock::now();
-
   reply->set_term(current_term_);
+
+  // consistency check
+  int prev_idx = request->prevlogindex();
+  if (prev_idx >= 0) {
+    if (prev_idx >= log_.size() ||
+        log_[prev_idx].term() != request->prevlogterm()) {
+      reply->set_success(false);
+      return grpc::Status::OK;
+    }
+  }
+
+  // conflict resolution and append
+  int log_insert_index = prev_idx + 1;
+  for (int i = 0; i < request->entries_size(); ++i) {
+    const auto &new_entry = request->entries(i);
+
+    // existing entry conflicts with a new one
+    if (log_insert_index < log_.size() &&
+        log_[log_insert_index].term() != new_entry.term()) {
+      log_.erase(log_.begin() + log_insert_index,
+                 log_.end()); // delete everything starting from here
+    }
+
+    // append new entries not already in the log
+    if (log_insert_index >= log_.size()) {
+      log_.push_back(new_entry);
+      std::cout << "[Replication] Node " << node_id_
+                << " replicated log at index " << log_insert_index << "\n";
+    }
+    log_insert_index++;
+  }
+
+  // update commit index
+  if (request->leadercommit() > commit_index_) {
+    commit_index_ =
+        std::min((int)request->leadercommit(), (int)log_.size() - 1);
+    ApplyCommittedEntries(); // apply to store
+  }
+
+  reply->set_success(true);
+  return grpc::Status::OK;
+}
+
+grpc::Status RaftNode::SubmitCommand(grpc::ServerContext *context,
+                                     const raftpb::ClientRequest *request,
+                                     raftpb::ClientReply *reply) {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+
+  if (state_ != NodeState::LEADER) {
+    reply->set_success(false);
+    reply->set_leaderhint("Unknown");
+    return grpc::Status::OK;
+  }
+
+  std::string cmd = request->command();
+
+  // intercept get requests
+  if (cmd.rfind("GET ", 0) == 0) {
+    std::string key = cmd.substr(4);
+    auto val = store_.get(key);
+
+    reply->set_success(true);
+    if (val) {
+      reply->set_value(*val);
+    } else {
+      reply->set_value("NULL");
+    }
+
+    std::cout << "[Client] GET key '" << key << "'\n";
+    return grpc::Status::OK;
+  }
+
+  // append the command to local raft log
+  raftpb::LogEntry new_entry;
+  new_entry.set_term(current_term_);
+  new_entry.set_command(request->command());
+
+  log_.push_back(new_entry);
+
+  int entry_index = log_.size() - 1; // 0 indexed log
+
+  std::cout << "\n[Client] Received Command: '" << request->command()
+            << "' | Appended to Raft Log at index " << entry_index << "\n";
+
+  SendHeartbeats();
+
   reply->set_success(true);
 
   return grpc::Status::OK;
+}
+
+void RaftNode::ApplyCommittedEntries() {
+  // if commit index has moved forward, apply all unapplied entries
+  while (last_applied_ < commit_index_) {
+    last_applied_++;
+    const auto &entry = log_[last_applied_];
+
+    std::string cmd = entry.command();
+    if (cmd.rfind("SET ", 0) == 0) {
+      size_t space1 = cmd.find(' ');
+      size_t space2 = cmd.find(' ', space1 + 1);
+      if (space1 != std::string::npos && space2 != std::string::npos) {
+        std::string key = cmd.substr(space1 + 1, space2 - space1 - 1);
+        std::string val = cmd.substr(space2 + 1);
+
+        store_.set(key, val);
+        std::cout << "\n[Store] Committed to Disk: " << key << " = " << val
+                  << "\n";
+      }
+    } else if (cmd.rfind("DEL", 0) == 0) {
+      std::string key = cmd.substr(4); // skip "DEL "
+      store_.remove(key);
+      std::cout << "[Store] Deleted from Disk: " << key << "\n";
+    }
+  }
 }
 
 } // namespace kvstore
