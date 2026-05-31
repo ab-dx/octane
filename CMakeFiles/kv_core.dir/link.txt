@@ -1,0 +1,2 @@
+/usr/bin/ar qc libkv_core.a CMakeFiles/kv_core.dir/src/core/store.cpp.o CMakeFiles/kv_core.dir/src/core/wal.cpp.o CMakeFiles/kv_core.dir/src/core/raft_node.cpp.o CMakeFiles/kv_core.dir/src/core/sstable_writer.cpp.o CMakeFiles/kv_core.dir/src/core/sstable_reader.cpp.o
+/usr/bin/ranlib libkv_core.a

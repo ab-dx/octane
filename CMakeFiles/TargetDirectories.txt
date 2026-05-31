@@ -1,0 +1,6 @@
+/home/helix/code/octane/CMakeFiles/raft_proto.dir
+/home/helix/code/octane/CMakeFiles/kv_core.dir
+/home/helix/code/octane/CMakeFiles/kv_server.dir
+/home/helix/code/octane/CMakeFiles/kv_client.dir
+/home/helix/code/octane/CMakeFiles/edit_cache.dir
+/home/helix/code/octane/CMakeFiles/rebuild_cache.dir

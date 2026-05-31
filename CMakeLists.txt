@@ -37,6 +37,8 @@ add_library(kv_core
     src/core/store.cpp
     src/core/wal.cpp
     src/core/raft_node.cpp
+    src/core/sstable_writer.cpp
+    src/core/sstable_reader.cpp
 )
 target_include_directories(kv_core PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_link_libraries(kv_core PUBLIC Threads::Threads raft_proto)
@@ -45,4 +47,4 @@ add_executable(kv_server src/server/main.cpp)
 target_link_libraries(kv_server PRIVATE kv_core)
 
 add_executable(kv_client src/client/client.cpp)
-target_link_libraries(kv_client PRIVATE raft_proto) 
+target_link_libraries(kv_client PRIVATE raft_proto)
