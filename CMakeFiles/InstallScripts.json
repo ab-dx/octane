@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/helix/code/octane/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

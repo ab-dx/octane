@@ -1,5 +1,6 @@
 #pragma once
 
+#include "kvstore/sstable_reader.hpp"
 #include "kvstore/wal.hpp"
 #include <atomic>
 #include <memory>
@@ -8,6 +9,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace kvstore {
 
@@ -38,6 +40,8 @@ private:
 
   // in-memory tree
   MemTable memtable_;
+  // on disk sstables
+  std::vector<std::unique_ptr<SSTableReader>> sstables_;
 
   // tracker for memory usage to trigger flushes
   size_t estimated_memtable_size_;

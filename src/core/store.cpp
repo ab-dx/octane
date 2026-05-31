@@ -1,4 +1,5 @@
 #include "kvstore/store.hpp"
+#include "kvstore/sstable.hpp"
 #include <iostream>
 
 namespace kvstore {
@@ -40,7 +41,13 @@ std::optional<std::string> KVStore::get(const std::string &key) const {
     return it->second.value;
   }
 
-  // TODO: if not in the MemTable, search the SSTables
+  // if not in the MemTable, search the SSTables
+  for (auto it = sstables_.rbegin(); it != sstables_.rend(); ++it) {
+    auto val = (*it)->get(key);
+    if (val) {
+      return val;
+    }
+  }
 
   return std::nullopt;
 }
@@ -84,7 +91,11 @@ void KVStore::flush_memtable_to_sstable() {
   std::cout << "\n[KVStore] MemTable size (" << estimated_memtable_size_
             << " bytes) reached threshold. Initiating flush to SSTable...\n";
 
-  // TODO: SSTable Serialization.
+  std::string sst_filename =
+      directory_ + "/0_" + std::to_string(current_log_id_) + ".sst";
+
+  SSTableWriter writer(sst_filename);
+  writer.write_memtable(memtable_);
 
   // clear the active MemTable
   memtable_.clear();
