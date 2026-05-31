@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kvstore/wal.hpp"
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -30,12 +31,23 @@ public:
   bool remove(const std::string &key);
 
 private:
-  // underlying map for kv store
-  std::unordered_map<std::string, std::string> store_;
-  // shared mutex for shared reading and exclusive writes
+  void check_and_flush();
+  void flush_memtable_to_sstable();
+
+  std::string directory_;
+
+  // in-memory tree
+  MemTable memtable_;
+
+  // tracker for memory usage to trigger flushes
+  size_t estimated_memtable_size_;
+
   mutable std::shared_mutex rw_mutex_;
-  // write ahead log
   std::unique_ptr<WriteAheadLog> wal_;
+
+  // global monotonically increasing sequence number
+  std::atomic<uint64_t> sequence_number_;
+  uint64_t current_log_id_;
 };
 
 } // namespace kvstore
