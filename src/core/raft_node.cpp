@@ -7,21 +7,24 @@ RaftNode::RaftNode(KVStore &store, int my_id,
                    const std::vector<std::string> &peer_addresses)
     : store_(store), state_(NodeState::FOLLOWER), current_term_(0),
       voted_for_(-1), node_id_(my_id), rng_(std::random_device{}()),
-      timeout_dist_(150, 300), running_(true) {
+      timeout_dist_(150, 300), running_(true), commit_index_(-1),
+      last_applied_(-1) {
 
   // build connections to peers
-  int peer_id = 0;
+  int current_peer_id = 0;
   for (const auto &addr : peer_addresses) {
-    if (peer_id != node_id_) { // don't connect to self
-      peers_.push_back(
-          {peer_id, raftpb::RaftNode::NewStub(grpc::CreateChannel(
-                        addr, grpc::InsecureChannelCredentials()))});
-      std::cout << "[Network] Node " << node_id_
-                << " configured to talk to Peer " << peer_id << " at " << addr
-                << "\n";
+    if (current_peer_id == node_id_) {
+      current_peer_id++;
     }
-    peer_id++;
+    peers_.push_back(
+        {current_peer_id, raftpb::RaftNode::NewStub(grpc::CreateChannel(
+                              addr, grpc::InsecureChannelCredentials()))});
+    std::cout << "[Network] Node " << node_id_ << " configured to talk to Peer "
+              << current_peer_id << " at " << addr << "\n";
+    current_peer_id++;
   }
+  // start async event loop thread
+  cq_thread_ = std::thread(&RaftNode::AsyncCompleteRpc, this);
 
   last_heartbeat_ = std::chrono::steady_clock::now();
   background_thread_ = std::thread(&RaftNode::ElectionLoop, this);
@@ -29,6 +32,10 @@ RaftNode::RaftNode(KVStore &store, int my_id,
 
 RaftNode::~RaftNode() {
   running_ = false;
+  // shutdown completion queue
+  cq_.Shutdown();
+  if (cq_thread_.joinable())
+    cq_thread_.join();
 
   if (background_thread_.joinable()) {
     background_thread_.join();
@@ -87,51 +94,63 @@ void RaftNode::ElectionLoop() {
 }
 
 void RaftNode::StartElection() {
+  int election_term;
+
+  // extract the term inside a lock
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    election_term = current_term_;
+  }
+
   std::cout << "\n[Election] Node " << node_id_
-            << " starting election for Term " << current_term_ << "\n";
+            << " starting election for Term " << election_term << "\n";
 
   std::shared_ptr<std::atomic<int>> votes_received =
       std::make_shared<std::atomic<int>>(1);
   int majority = (peers_.size() + 1) / 2 + 1;
 
   for (const auto &peer : peers_) {
-    std::thread([this, &peer, votes_received, majority]() {
+    int p_id = peer.id;
+    raftpb::RaftNode::Stub *stub_ptr = peer.stub.get();
+
+    std::thread([this, p_id, stub_ptr, votes_received, majority,
+                 election_term]() {
       raftpb::RequestVoteArgs args;
       raftpb::RequestVoteReply reply;
       grpc::ClientContext context;
 
-      // wait for 50ms to reply
       context.set_deadline(std::chrono::system_clock::now() +
                            std::chrono::milliseconds(50));
 
       {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        args.set_term(current_term_);
+
+        if (current_term_ != election_term)
+          return;
+
+        args.set_term(election_term);
         args.set_candidateid(node_id_);
       }
 
-      grpc::Status status = peer.stub->RequestVote(&context, args, &reply);
+      grpc::Status status = stub_ptr->RequestVote(&context, args, &reply);
 
       if (status.ok() && reply.votegranted()) {
         (*votes_received)++;
-        std::cout << "[Election] Got vote from Peer " << peer.id
-                  << ". Total: " << *votes_received << "\n";
 
-        // when majority votes received, become leader
         if (*votes_received >= majority) {
           std::lock_guard<std::mutex> lock(state_mutex_);
-          if (state_ == NodeState::CANDIDATE) {
+
+          if (state_ == NodeState::CANDIDATE &&
+              current_term_ == election_term) {
             state_ = NodeState::LEADER;
 
             for (const auto &p : peers_) {
-              // next index to send is right after current log end
               next_index_[p.id] = log_.size();
-              match_index_[p.id] = -1; // nothing replicated yet
+              match_index_[p.id] = -1;
             }
 
             std::cout << "NODE " << node_id_ << " IS THE NEW LEADER FOR TERM "
                       << current_term_ << "\n";
-            // start sending heartbeats
             SendHeartbeats();
           }
         }
@@ -141,82 +160,43 @@ void RaftNode::StartElection() {
 }
 
 void RaftNode::SendHeartbeats() {
+  if (state_ != NodeState::LEADER)
+    return;
+
   for (const auto &peer : peers_) {
-    std::thread([this, &peer]() {
-      raftpb::AppendEntriesArgs args;
-      raftpb::AppendEntriesReply reply;
-      grpc::ClientContext context;
-      context.set_deadline(std::chrono::system_clock::now() +
-                           std::chrono::milliseconds(50));
+    auto call = std::make_unique<AsyncClientCall>();
+    call->peer_id = peer.id;
+    call->req_term = current_term_;
 
-      int peer_next_idx;
+    call->context.set_deadline(std::chrono::system_clock::now() +
+                               std::chrono::milliseconds(50));
 
-      {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        if (state_ != NodeState::LEADER)
-          return; // exit if not leader
+    call->request.set_term(current_term_);
+    call->request.set_leaderid(node_id_);
+    call->request.set_leadercommit(commit_index_);
 
-        args.set_term(current_term_);
-        args.set_leaderid(node_id_);
-        args.set_leadercommit(commit_index_);
+    int peer_next_idx = next_index_[peer.id];
 
-        peer_next_idx = next_index_[peer.id];
-        int prev_log_index = peer_next_idx - 1;
+    int prev_log_index = peer_next_idx - 1;
+    int prev_log_term =
+        (prev_log_index >= 0 && prev_log_index < (int)log_.size())
+            ? log_[prev_log_index].term()
+            : 0;
 
-        // calculate previous term
-        int prev_log_term =
-            (prev_log_index >= 0 && prev_log_index < log_.size())
-                ? log_[prev_log_index].term()
-                : 0;
+    call->request.set_prevlogindex(prev_log_index);
+    call->request.set_prevlogterm(prev_log_term);
 
-        args.set_prevlogindex(prev_log_index);
-        args.set_prevlogterm(prev_log_term);
+    for (size_t i = peer_next_idx; i < log_.size(); ++i) {
+      *call->request.add_entries() = log_[i];
+    }
 
-        // add any missing entries to the RPC
-        for (size_t i = peer_next_idx; i < log_.size(); ++i) {
-          *args.add_entries() = log_[i];
-        }
-      }
+    call->response_reader = peer.stub->PrepareAsyncAppendEntries(
+        &call->context, call->request, &cq_);
+    call->response_reader->StartCall();
+    AsyncClientCall *call_ptr = call.release();
 
-      grpc::Status status = peer.stub->AppendEntries(&context, args, &reply);
-
-      if (status.ok()) {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        if (state_ != NodeState::LEADER || current_term_ != args.term())
-          return;
-
-        if (reply.term() > current_term_) {
-          BecomeFollower(reply.term());
-          return;
-        }
-
-        if (reply.success()) {
-          match_index_[peer.id] = args.prevlogindex() + args.entries_size();
-          next_index_[peer.id] = match_index_[peer.id] + 1;
-
-          // commit a new entry if a majority replicated
-          for (int n = log_.size() - 1; n > commit_index_; --n) {
-            if (log_[n].term() == current_term_) {
-              int match_count = 1;
-              for (const auto &p : peers_) {
-                if (match_index_[p.id] >= n)
-                  match_count++;
-              }
-
-              int majority = (peers_.size() + 1) / 2 + 1;
-              if (match_count >= majority) {
-                commit_index_ = n;       // move the commit line forward
-                ApplyCommittedEntries(); // apply to store
-                break;
-              }
-            }
-          }
-        } else {
-          // decrement next_index and retry with older logs next heartbeat
-          next_index_[peer.id] = std::max(0, next_index_[peer.id] - 1);
-        }
-      }
-    }).detach();
+    call_ptr->response_reader->Finish(&call_ptr->reply, &call_ptr->status,
+                                      static_cast<void *>(call_ptr));
   }
 }
 
@@ -381,6 +361,64 @@ void RaftNode::ApplyCommittedEntries() {
       std::string key = cmd.substr(4); // skip "DEL "
       store_.remove(key);
       std::cout << "[Store] Deleted from Disk: " << key << "\n";
+    }
+  }
+}
+
+void RaftNode::HandleAppendEntriesReply(AsyncClientCall *call) {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+
+  // ignore if not leader
+  if (state_ != NodeState::LEADER)
+    return;
+
+  if (call->req_term != current_term_)
+    return;
+
+  if (call->reply.term() > current_term_) {
+    BecomeFollower(call->reply.term());
+    return;
+  }
+
+  if (call->reply.success()) {
+    // calculate how many entries were successfully replicated
+    match_index_[call->peer_id] =
+        call->request.prevlogindex() + call->request.entries_size();
+    next_index_[call->peer_id] = match_index_[call->peer_id] + 1;
+
+    // check if any new entries can be committed
+    for (int n = log_.size() - 1; n > commit_index_; --n) {
+      if (log_[n].term() == current_term_) {
+        int match_count = 1;
+        for (const auto &p : peers_) {
+          if (match_index_[p.id] >= n)
+            match_count++;
+        }
+        int majority = (peers_.size() + 1) / 2 + 1;
+        if (match_count >= majority) {
+          commit_index_ = n;
+          ApplyCommittedEntries();
+          break;
+        }
+      }
+    }
+  } else {
+    // decrement next_index and retry next heartbeat
+    next_index_[call->peer_id] = std::max(0, next_index_[call->peer_id] - 1);
+  }
+}
+
+void RaftNode::AsyncCompleteRpc() {
+  void *got_tag;
+  bool ok = false;
+
+  // block until next result is available in cq
+  while (cq_.Next(&got_tag, &ok)) {
+    std::unique_ptr<AsyncClientCall> call(
+        static_cast<AsyncClientCall *>(got_tag));
+
+    if (call->status.ok() && ok) {
+      HandleAppendEntriesReply(call.get());
     }
   }
 }

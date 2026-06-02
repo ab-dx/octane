@@ -21,6 +21,17 @@ struct Peer {
   std::unique_ptr<raftpb::RaftNode::Stub> stub;
 };
 
+struct AsyncClientCall {
+  raftpb::AppendEntriesArgs request;
+  raftpb::AppendEntriesReply reply;
+  grpc::ClientContext context;
+  grpc::Status status;
+  std::unique_ptr<grpc::ClientAsyncResponseReader<raftpb::AppendEntriesReply>>
+      response_reader;
+  int peer_id;
+  int req_term;
+};
+
 class RaftNode final : public raftpb::RaftNode::Service {
 public:
   RaftNode(KVStore &store, int my_id,
@@ -68,11 +79,16 @@ private:
   // track the highest log index known to be replicated on each peer
   std::unordered_map<int, int> match_index_;
 
+  grpc::CompletionQueue cq_; // job queue for async tasks
+  std::thread cq_thread_;
+
+  void AsyncCompleteRpc();
   void ElectionLoop();
   void BecomeFollower(int new_term);
   void StartElection();
   void SendHeartbeats();
   void ApplyCommittedEntries();
+  void HandleAppendEntriesReply(AsyncClientCall *call);
 };
 
 } // namespace kvstore
