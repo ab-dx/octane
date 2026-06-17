@@ -32,6 +32,17 @@ struct AsyncClientCall {
   int req_term;
 };
 
+struct AsyncVoteCall {
+  raftpb::RequestVoteArgs request;
+  raftpb::RequestVoteReply reply;
+  grpc::ClientContext context;
+  grpc::Status status;
+  std::unique_ptr<grpc::ClientAsyncResponseReader<raftpb::RequestVoteReply>>
+      response_reader;
+  int peer_id;
+  int req_term;
+};
+
 class RaftNode final : public raftpb::RaftNode::Service {
 public:
   RaftNode(KVStore &store, int my_id,
@@ -58,6 +69,7 @@ private:
   int current_term_;
   int voted_for_;
   int node_id_;
+  int votes_received_ = 0;
 
   std::vector<Peer> peers_; // other peers in the network
 
@@ -82,6 +94,14 @@ private:
   grpc::CompletionQueue cq_; // job queue for async tasks
   std::thread cq_thread_;
 
+  // rpc registry
+  uint64_t next_rpc_id_ = 0;
+  std::mutex rpc_mutex_; // protects ID counter and two maps below
+
+  std::unordered_map<uint64_t, std::unique_ptr<AsyncClientCall>>
+      in_flight_rpcs_;
+  std::unordered_map<uint64_t, std::unique_ptr<AsyncVoteCall>> in_flight_votes_;
+
   void AsyncCompleteRpc();
   void ElectionLoop();
   void BecomeFollower(int new_term);
@@ -89,6 +109,7 @@ private:
   void SendHeartbeats();
   void ApplyCommittedEntries();
   void HandleAppendEntriesReply(AsyncClientCall *call);
+  void HandleRequestVoteReply(AsyncVoteCall *call);
 };
 
 } // namespace kvstore

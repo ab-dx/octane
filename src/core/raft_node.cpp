@@ -100,62 +100,41 @@ void RaftNode::StartElection() {
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
     election_term = current_term_;
+    votes_received_ = 1; // vote for itself
   }
 
   std::cout << "\n[Election] Node " << node_id_
             << " starting election for Term " << election_term << "\n";
 
-  std::shared_ptr<std::atomic<int>> votes_received =
-      std::make_shared<std::atomic<int>>(1);
-  int majority = (peers_.size() + 1) / 2 + 1;
-
   for (const auto &peer : peers_) {
-    int p_id = peer.id;
-    raftpb::RaftNode::Stub *stub_ptr = peer.stub.get();
+    uint64_t rpc_id;
+    {
+      std::lock_guard<std::mutex> lock(rpc_mutex_);
+      rpc_id = ++next_rpc_id_;
+    }
 
-    std::thread([this, p_id, stub_ptr, votes_received, majority,
-                 election_term]() {
-      raftpb::RequestVoteArgs args;
-      raftpb::RequestVoteReply reply;
-      grpc::ClientContext context;
+    auto call = std::make_unique<AsyncVoteCall>();
+    call->peer_id = peer.id;
+    call->req_term = election_term;
 
-      context.set_deadline(std::chrono::system_clock::now() +
-                           std::chrono::milliseconds(50));
+    call->context.set_deadline(std::chrono::system_clock::now() +
+                               std::chrono::milliseconds(50));
+    call->request.set_term(election_term);
+    call->request.set_candidateid(node_id_);
 
-      {
-        std::lock_guard<std::mutex> lock(state_mutex_);
+    call->response_reader =
+        peer.stub->PrepareAsyncRequestVote(&call->context, call->request, &cq_);
+    call->response_reader->StartCall();
 
-        if (current_term_ != election_term)
-          return;
+    // tag with ID
+    call->response_reader->Finish(&call->reply, &call->status,
+                                  reinterpret_cast<void *>(rpc_id));
 
-        args.set_term(election_term);
-        args.set_candidateid(node_id_);
-      }
-
-      grpc::Status status = stub_ptr->RequestVote(&context, args, &reply);
-
-      if (status.ok() && reply.votegranted()) {
-        (*votes_received)++;
-
-        if (*votes_received >= majority) {
-          std::lock_guard<std::mutex> lock(state_mutex_);
-
-          if (state_ == NodeState::CANDIDATE &&
-              current_term_ == election_term) {
-            state_ = NodeState::LEADER;
-
-            for (const auto &p : peers_) {
-              next_index_[p.id] = log_.size();
-              match_index_[p.id] = -1;
-            }
-
-            std::cout << "NODE " << node_id_ << " IS THE NEW LEADER FOR TERM "
-                      << current_term_ << "\n";
-            SendHeartbeats();
-          }
-        }
-      }
-    }).detach();
+    // move into registry
+    {
+      std::lock_guard<std::mutex> lock(rpc_mutex_);
+      in_flight_votes_[rpc_id] = std::move(call);
+    }
   }
 }
 
@@ -164,19 +143,23 @@ void RaftNode::SendHeartbeats() {
     return;
 
   for (const auto &peer : peers_) {
+    uint64_t rpc_id;
+    {
+      std::lock_guard<std::mutex> lock(rpc_mutex_);
+      rpc_id = ++next_rpc_id_;
+    }
+
     auto call = std::make_unique<AsyncClientCall>();
     call->peer_id = peer.id;
     call->req_term = current_term_;
 
     call->context.set_deadline(std::chrono::system_clock::now() +
                                std::chrono::milliseconds(50));
-
     call->request.set_term(current_term_);
     call->request.set_leaderid(node_id_);
     call->request.set_leadercommit(commit_index_);
 
     int peer_next_idx = next_index_[peer.id];
-
     int prev_log_index = peer_next_idx - 1;
     int prev_log_term =
         (prev_log_index >= 0 && prev_log_index < (int)log_.size())
@@ -193,10 +176,16 @@ void RaftNode::SendHeartbeats() {
     call->response_reader = peer.stub->PrepareAsyncAppendEntries(
         &call->context, call->request, &cq_);
     call->response_reader->StartCall();
-    AsyncClientCall *call_ptr = call.release();
 
-    call_ptr->response_reader->Finish(&call_ptr->reply, &call_ptr->status,
-                                      static_cast<void *>(call_ptr));
+    // tag with ID
+    call->response_reader->Finish(&call->reply, &call->status,
+                                  reinterpret_cast<void *>(rpc_id));
+
+    // store in map
+    {
+      std::lock_guard<std::mutex> lock(rpc_mutex_);
+      in_flight_rpcs_[rpc_id] = std::move(call);
+    }
   }
 }
 
@@ -408,17 +397,79 @@ void RaftNode::HandleAppendEntriesReply(AsyncClientCall *call) {
   }
 }
 
+void RaftNode::HandleRequestVoteReply(AsyncVoteCall *call) {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+
+  // if we are not the leader, or reply from old term, reject
+  if (state_ != NodeState::CANDIDATE || call->req_term != current_term_) {
+    return;
+  }
+
+  // if reply from a higher term, we are outdated
+  if (call->reply.term() > current_term_) {
+    BecomeFollower(call->reply.term());
+    return;
+  }
+
+  // tally the vote
+  if (call->reply.votegranted()) {
+    votes_received_++;
+    std::cout << "[Election] Got vote from Peer " << call->peer_id
+              << ". Total: " << votes_received_ << "\n";
+
+    int majority = (peers_.size() + 1) / 2 + 1;
+
+    // check for majority
+    if (votes_received_ >= majority) {
+      state_ = NodeState::LEADER;
+
+      for (const auto &p : peers_) {
+        next_index_[p.id] = log_.size();
+        match_index_[p.id] = -1;
+      }
+
+      std::cout << "NODE " << node_id_ << " IS THE NEW LEADER FOR TERM "
+                << current_term_ << "\n";
+
+      SendHeartbeats();
+    }
+  }
+}
+
 void RaftNode::AsyncCompleteRpc() {
   void *got_tag;
   bool ok = false;
 
-  // block until next result is available in cq
   while (cq_.Next(&got_tag, &ok)) {
-    std::unique_ptr<AsyncClientCall> call(
-        static_cast<AsyncClientCall *>(got_tag));
+    uint64_t rpc_id = reinterpret_cast<uint64_t>(got_tag);
 
-    if (call->status.ok() && ok) {
-      HandleAppendEntriesReply(call.get());
+    std::unique_ptr<AsyncClientCall> append_call;
+    std::unique_ptr<AsyncVoteCall> vote_call;
+
+    // search both maps
+    {
+      std::lock_guard<std::mutex> lock(rpc_mutex_);
+
+      auto it_append = in_flight_rpcs_.find(rpc_id);
+      if (it_append != in_flight_rpcs_.end()) {
+        append_call = std::move(it_append->second);
+        in_flight_rpcs_.erase(it_append);
+      } else {
+        auto it_vote = in_flight_votes_.find(rpc_id);
+        if (it_vote != in_flight_votes_.end()) {
+          vote_call = std::move(it_vote->second);
+          in_flight_votes_.erase(it_vote);
+        }
+      }
+    }
+
+    // process if network didn't fail
+    if (ok) {
+      if (append_call && append_call->status.ok()) {
+        HandleAppendEntriesReply(append_call.get());
+      } else if (vote_call && vote_call->status.ok()) {
+        HandleRequestVoteReply(vote_call.get());
+      }
     }
   }
 }
