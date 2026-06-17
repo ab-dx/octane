@@ -8,6 +8,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -16,7 +17,7 @@ namespace kvstore {
 class KVStore {
 public:
   explicit KVStore(const std::string &directory);
-  ~KVStore() = default;
+  ~KVStore();
 
   // delete copy/move constructors
   // to prevent accidental copying of db
@@ -36,6 +37,10 @@ private:
   void check_and_flush();
   void flush_memtable_to_sstable();
 
+  std::vector<std::string> get_all_sstable_filepaths() const;
+  void perform_major_compaction();
+  void compaction_worker();
+
   std::string directory_;
 
   // in-memory tree
@@ -52,6 +57,10 @@ private:
   // global monotonically increasing sequence number
   std::atomic<uint64_t> sequence_number_;
   uint64_t current_log_id_;
+
+  // for compaction worker thread
+  std::atomic<bool> running_;
+  std::thread compaction_thread_;
 };
 
 } // namespace kvstore

@@ -109,4 +109,44 @@ std::optional<std::string> SSTableReader::get(const std::string &key) {
   return std::nullopt;
 }
 
+SSTableIterator::SSTableIterator(const std::string &filepath, size_t file_idx)
+    : file_idx_(file_idx), valid_(true) {
+  file_.open(filepath, std::ios::in | std::ios::binary);
+
+  // find where the index starts to know when to stop reading
+  file_.seekg(-8, std::ios::end);
+  file_.read(reinterpret_cast<char *>(&index_offset_), sizeof(index_offset_));
+
+  file_.seekg(0, std::ios::beg);
+  next(); // load the first record
+}
+
+void SSTableIterator::next() {
+  if (static_cast<uint64_t>(file_.tellg()) >= index_offset_) {
+    valid_ = false;
+    return;
+  }
+
+  SSTRecordHeader header;
+  if (!file_.read(reinterpret_cast<char *>(&header), sizeof(header))) {
+    valid_ = false;
+    return;
+  }
+
+  current_record_.seq_num = header.seq_num;
+  current_record_.is_tombstone = (header.is_tombstone == 1);
+  current_record_.file_index = file_idx_;
+
+  current_record_.key.resize(header.key_len);
+  file_.read(current_record_.key.data(), header.key_len);
+
+  current_record_.value.resize(header.val_len);
+  if (header.val_len > 0) {
+    file_.read(current_record_.value.data(), header.val_len);
+  }
+}
+
+bool SSTableIterator::is_valid() const { return valid_; }
+MergedRecord SSTableIterator::current() const { return current_record_; }
+
 } // namespace kvstore
