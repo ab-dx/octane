@@ -121,6 +121,9 @@ void KVStore::flush_memtable_to_sstable() {
 
   std::cout << "[KVStore] Flush complete. WAL rotated to log ID "
             << current_log_id_ << "\n";
+  if (on_flush_callback_) {
+    on_flush_callback_();
+  }
 }
 
 struct MergeComparator {

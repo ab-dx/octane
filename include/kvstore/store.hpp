@@ -3,6 +3,7 @@
 #include "kvstore/sstable_reader.hpp"
 #include "kvstore/wal.hpp"
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -33,6 +34,10 @@ public:
   // delete a key
   bool remove(const std::string &key);
 
+  void set_flush_callback(std::function<void()> callback) {
+    on_flush_callback_ = std::move(callback);
+  }
+
 private:
   void check_and_flush();
   void flush_memtable_to_sstable();
@@ -61,6 +66,8 @@ private:
   // for compaction worker thread
   std::atomic<bool> running_;
   std::thread compaction_thread_;
+
+  std::function<void()> on_flush_callback_;
 };
 
 } // namespace kvstore

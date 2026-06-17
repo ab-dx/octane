@@ -161,14 +161,13 @@ void RaftNode::SendHeartbeats() {
 
     int peer_next_idx = next_index_[peer.id];
     int prev_log_index = peer_next_idx - 1;
-    int prev_log_term =
-        (prev_log_index >= 0 && prev_log_index < (int)log_.size())
-            ? log_[prev_log_index].term()
-            : 0;
+    int prev_log_term = GetTerm(prev_log_index);
 
     call->request.set_prevlogindex(prev_log_index);
     call->request.set_prevlogterm(prev_log_term);
 
+    int local_start_idx = peer_next_idx - last_included_index_ - 1;
+    local_start_idx = std::max(0, local_start_idx);
     for (size_t i = peer_next_idx; i < log_.size(); ++i) {
       *call->request.add_entries() = log_[i];
     }
@@ -278,6 +277,37 @@ grpc::Status RaftNode::AppendEntries(grpc::ServerContext *context,
 
   reply->set_success(true);
   return grpc::Status::OK;
+}
+
+void RaftNode::TruncateLog() {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+
+  if (last_applied_ <= last_included_index_)
+    return;
+  int local_index = last_applied_ - last_included_index_ - 1;
+
+  if (local_index < 0 || local_index >= log_.size())
+    return;
+
+  last_included_term_ = log_[local_index].term();
+  last_included_index_ = last_applied_;
+
+  // erase from log
+  log_.erase(log_.begin(), log_.begin() + local_index + 1);
+
+  std::cout << "[Garbage Collection] Raft log truncated up to absolute index "
+            << last_included_index_ << ". RAM freed!\n";
+}
+
+int RaftNode::GetTerm(int absolute_index) {
+  if (absolute_index == last_included_index_) {
+    return last_included_term_;
+  }
+  int local_index = absolute_index - last_included_index_ - 1;
+  if (local_index >= 0 && local_index < log_.size()) {
+    return log_[local_index].term();
+  }
+  return 0;
 }
 
 grpc::Status RaftNode::SubmitCommand(grpc::ServerContext *context,

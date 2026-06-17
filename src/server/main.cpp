@@ -30,6 +30,8 @@ int main(int argc, char **argv) {
   kvstore::KVStore db(db_dir);
   kvstore::RaftNode raft_service(db, my_id, peer_addresses);
 
+  db.set_flush_callback([&raft_service]() { raft_service.TruncateLog(); });
+
   grpc::ServerBuilder builder;
   builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
   builder.RegisterService(&raft_service);

@@ -60,6 +60,7 @@ public:
   grpc::Status SubmitCommand(grpc::ServerContext *context,
                              const raftpb::ClientRequest *request,
                              raftpb::ClientReply *reply) override;
+  void TruncateLog();
 
 private:
   KVStore &store_;
@@ -80,6 +81,10 @@ private:
 
   std::atomic<bool> running_;
   std::thread background_thread_;
+
+  // index and term of last compacted entry
+  int last_included_index_ = -1;
+  int last_included_term_ = 0;
 
   // raft log
   std::vector<raftpb::LogEntry> log_;
@@ -102,6 +107,7 @@ private:
       in_flight_rpcs_;
   std::unordered_map<uint64_t, std::unique_ptr<AsyncVoteCall>> in_flight_votes_;
 
+  int GetTerm(int absolute_index);
   void AsyncCompleteRpc();
   void ElectionLoop();
   void BecomeFollower(int new_term);
