@@ -1,7 +1,34 @@
 <h1 align="center">Octane</h1>
 
+<div align="center">
+
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/ab-dx/octane/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![C++17](https://img.shields.io/badge/C++-17-blue.svg?logo=c%2B%2B)](https://isocpp.org/)
+[![gRPC](https://img.shields.io/badge/gRPC-244C5A?logo=grpc&logoColor=white)](https://grpc.io/)
+
+</div>
+
 A fault-tolerant distributed key-value store built from scratch in C++17, implementing the Raft consensus algorithm over gRPC/Protobuf for inter-node communication, with an LSM-Tree storage engine and CRC32-validated Write-Ahead Log for crash resiliency.
 
+---
+## Table of Contents
+- [Why Octane?](#why-octane)
+- [Architecture](#architecture)
+- [Components](#components)
+  - [RaftNode - Consensus Layer](#raftnode---consensus-layer)
+  - [KVStore - In-Memory State Machine](#kvstore---in-memory-state-machine)
+  - [LSM-Tree Storage Engine](#lsm-tree-storage-engine)
+  - [gRPC Protocol](#grpc-protocol)
+- [Design Decisions](#design-decisions)
+- [Project Structure](#project-structure)
+- [Building](#building)
+- [Running a 3-Node Cluster](#running-a-3-node-cluster)
+- [Fault Tolerance Guarantees](#fault-tolerance-guarantees)
+- [Benchmarks](#benchmarks)
+  - [End to End load testing](#end-to-end-load-testing)
+  - [Unit Testing](#unit-testing)
+- [Tech Stack](#tech-stack)
 ---
 
 ## Why Octane?
