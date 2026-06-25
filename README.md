@@ -1,130 +1,207 @@
 # Octane
 
-A Raft-based distributed key-value store implemented in C++ using gRPC for inter-node communication.
+A fault-tolerant distributed key-value store built from scratch in C++17, implementing the Raft consensus algorithm over gRPC/Protobuf for inter-node communication, with an LSM-Tree storage engine and CRC32-validated Write-Ahead Log for crash resiliency.
 
-## Components
+---
 
-### KVStore (`src/core/store.cpp`, `include/kvstore/store.hpp`)
+## Why Octane?
 
-In-memory key-value store with thread-safe operations using a shared mutex pattern.
+Most distributed storage systems treat the consensus layer, storage engine, and network transport as separate components. Octane aims to implement all three from scratch:
 
-- `get(key)` - Read with shared lock (concurrent readers allowed)
-- `set(key, value)` - Write with exclusive lock
-- `remove(key)` - Delete with exclusive lock
+- **Consensus** - Raft leader election and log replication with randomized 150–300ms timeouts to prevent split votes
+- **Storage** - LSM-Tree engine with 4MB MemTable flush threshold and immutable binary SSTables
+- **Durability** - CRC32-validated WAL that survives crashes and replays state deterministically
+- **Concurrency** - Shared mutex pattern that decouples high-throughput concurrent reads from serialized disk flushes
 
-Each mutation is persisted to WAL before updating in-memory state.
-
-### WriteAheadLog (`src/core/wal.cpp`, `include/kvstore/wal.hpp`)
-
-Disk-based write-ahead log for crash recovery. Each operation is appended to a
- WAL file, allowing reconstruction of in-memory state after crash.
-
-- `append_set(key, value)` - Log SET operations
-- `append_remove(key)` - Log REMOVE operations
-- `recover()` - Rebuild state from WAL on startup
-
-### RaftNode (`src/core/raft_node.cpp`, `include/kvstore/raft_node.hpp`)
-
-Raft consensus implementation with three roles:
-
-- **Follower** - Responds to leader heartbeats and vote requests
-- **Candidate** - Initiates election, requests votes from peers
-- **Leader** - Accepts client commands, replicates log entries
-
-**Key Raft Features**:
-- Leader election with randomized election timeouts
-- Log replication via AppendEntries RPC
-- Term-based leader validity
-- Majority quorum for commit confirmation
-
-### Protocol (`proto/raft.proto`)
-
-gRPC service definition for Raft inter-node communication:
-
-| RPC | Direction | Purpose |
-|-----|-----------|---------|
-| `RequestVote` | Candidate → Followers | Leader election |
-| `AppendEntries` | Leader → Followers | Log replication + heartbeats |
-| `SubmitCommand` | Client → Any Node | Submit KV operations |
+---
 
 ## Architecture
 
+![Architecture](./assets/architecture.png)
+
+Each node maintains a full replica of the log and state machine. Writes go through the leader, which replicates to a majority before committing. 
+
+---
+
+## Components
+
+### RaftNode - Consensus Layer
+
+`src/core/raft_node.cpp` · `include/kvstore/raft_node.hpp`
+
+![Raft](./assets/raft2.png)
+![Raft](./assets/raft.png)
+
+The core Raft state machine. Each node is always in one of three roles:
+
+| Role | Responsibilities |
+|------|-----------------|
+| **Follower** | Responds to `AppendEntries` heartbeats, resets election timer on each valid heartbeat, grants votes if candidate's log is at least as up-to-date |
+| **Candidate** | Triggered when election timer fires, increments term, votes for self, broadcasts `RequestVote` to peers, becomes Leader on majority grant |
+| **Leader** | Handles all client `SubmitCommand` RPCs, replicates log entries via `AppendEntries`,  sends periodic heartbeats to suppress follower elections |
+
+**Election timeout** is randomized between 150ms and 300ms per node. This asymmetry is the mechanism that prevents split votes - the node with the shortest timeout in any given round will almost always win the first election before others start campaigning.
+
+**Log replication** follows the standard Raft protocol: leader appends to its own log, issues parallel `AppendEntries` RPCs to all followers, and advances `commitIndex` once a majority responds with success. Followers apply committed entries to their local state machines in order.
+
+**Term-based validity** ensures stale leaders self-demote: any RPC response with a higher term causes the receiving node to immediately revert to Follower.
+
+---
+
+### KVStore - In-Memory State Machine
+
+`src/core/store.cpp` · `include/kvstore/store.hpp`
+
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                         Client                                 │
-└─────────────────────────────┬──────────────────────────────────┘
-                              │ gRPC
-                              ▼
-┌───────────────────────────────────────────────────────────┐
-│                     RaftNode (Leader)                     │
-│  ┌───────────┐  ┌───────────┐  ┌──────────────────────┐   │
-│  │  KVStore  │  │WriteAhead │  │  Raft Consensus Layer│   │
-│  │ (In-Mem)  │  │   Log     │  │ - Leader Election    │   │
-│  │           │  │           │  │ - Log Replication    │   │
-│  └───────────┘  └───────────┘  │ - Term Management    │   │
-│                                └──────────────────────┘   │
-└─────────────────────────────┬─────────────────────────────┘
-                              │ AppendEntries / RequestVote
-                              ▼ (gRPC)
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ RaftNode     │    │ RaftNode     │    │ RaftNode     │
-│ (Follower)   │    │ (Follower)   │    │ (Candidate)  │
-└──────────────┘    └──────────────┘    └──────────────┘
+get(key)     shared_lock     (concurrent reads, no blocking between readers)
+set(key, v)  unique_lock     (exclusive write, blocks new readers)
+remove(key)  unique_lock     (exclusive write, blocks new readers)
 ```
 
+The shared mutex pattern is a deliberate tradeoff: reads in a distributed KV store are typically much more frequent than writes, so allowing concurrent readers significantly increases read throughput without adding complexity of a lock-free structure.
 
-## Prerequisites
+---
 
-- C++17 compiler
+### LSM-Tree Storage Engine
+
+`src/core/wal.cpp` · `include/kvstore/wal.hpp`
+
+Octane uses a Log-Structured Merge-Tree architecture for its on-disk storage:
+
+![Storage](./assets/storage.jpg)
+
+**MemTable** holds recent writes in memory. It accepts mutations until it reaches the 4MB threshold, at which point it is frozen and flushed to a new SSTable. A fresh MemTable is created for subsequent writes. Background flushes are decoupled from client reads using the shared mutex - reads continue to be served from the in-memory HashMap while the flush happens concurrently.
+
+**SSTables** are immutable binary files. Once written, they are never modified, compaction or deletion creates new files. Immutability simplifies crash recovery: a partially written SSTable from a crash is simply discarded, the WAL has the source of truth.
+
+**WAL** is the durability anchor. Each entry is validated with a CRC32 checksum on read. Corrupted entries (from a partial write at crash time) are detected and the recovery stops at the last valid entry. On startup, `recover()` replays valid WAL entries in order to reconstruct the MemTable.
+
+```
+WAL entry format:
+  [ CRC32 (4 bytes) | op_type (1 byte) | key_len (4 bytes) | key | value_len (4 bytes) | value ]
+```
+
+---
+
+### gRPC Protocol
+
+`proto/raft.proto`
+
+Three RPCs cover all inter-node and client-to-cluster communication:
+
+| RPC | Caller -> Callee | Purpose |
+|-----|-----------------|---------|
+| `RequestVote(term, candidateId, lastLogIndex, lastLogTerm)` | Candidate -> all Followers | Leader election, follower grants vote if it hasn't voted this term and candidate's log is at least as complete |
+| `AppendEntries(term, leaderId, prevLogIndex, prevLogTerm, entries[], leaderCommit)` | Leader -> all Followers | Log replication, also serves as heartbeat when `entries` is empty |
+| `SubmitCommand(op, key, value)` | Client -> Node | Submit a KV operation, |
+
+
+---
+
+## Design Decisions
+
+- gRPC provides strong typing via Protobuf, automatic serialization/deserialization, built-in connection management and retries, and bidirectional streaming support for future optimizations (e.g. streaming `AppendEntries` for large log batches). Raw TCP with a custom protocol would require implementing all of this manually.
+
+- LSM-Trees optimize for write throughput by converting random writes into sequential appends (WAL -> MemTable -> SSTable). A B-Tree would require in-place page updates, which are more expensive on spinning disks and require more complex crash recovery.
+
+- The WAL is fsynced before the MemTable is updated. This ensures that on crash recovery, the WAL is always at least as current as the in-memory state. Updating the MemTable first, would create a window where a committed mutation exists in memory but not on disk, meaning it would be lost on crash.
+
+- Deterministic timeouts cause all followers to become candidates simultaneously when a leader dies, leading to a split vote where no candidate can win a majority. The 150–300ms random range means nodes stagger their elections naturally.
+
+---
+
+## Project Structure
+
+```
+octane/
+├── include/
+│   └── kvstore/
+│       ├── raft_node.hpp       # Raft state machine, role definitions, RPC handlers
+│       ├── store.hpp           # KVStore interface, shared_mutex declarations
+│       └── wal.hpp             # WAL interface, entry format, CRC32 validation
+├── proto/
+│   └── raft.proto              # gRPC service: RequestVote, AppendEntries, SubmitCommand
+├── src/
+│   └── core/
+│       ├── raft_node.cpp       # Raft implementation: election, replication, heartbeats
+│       ├── store.cpp           # In-memory HashMap with shared_mutex
+│       └── wal.cpp             # WAL append, fsync, CRC32, recovery
+├── CMakeLists.txt              # Build config: gRPC/Protobuf, C++17, generates kv_server + kv_client
+└── README.md
+```
+
+---
+
+## Building
+
+**Dependencies**
+
+- C++17 compiler (GCC 9+ or Clang 10+)
 - CMake 3.14+
-- gRPC 1.40+ (with C++ plugin)
+- gRPC 1.40+ with C++ plugin
 - Protobuf 3.9+
 
-## Build
+**Build**
 
 ```bash
-mkdir -p build && cd build
-cmake ..
-make
+mkdir -p build
+cmake --build build
 ```
 
-This produces:
+This produces two binaries in `build/`:
 - `kv_server` - Raft node server
-- `kv_client` - Client CLI tool
+- `kv_client` - CLI client
+
+---
 
 ## Running a 3-Node Cluster
 
-**Terminal 1** - Node 0 (port 50051)
+Each `kv_server` invocation takes a node ID, its own port, and the ports of all peer nodes.
+
 ```bash
-./kv_server 0 50051 50052 50053 50054
+# Terminal 1 - Node 0 on port 50051
+./kv_server 0 50051 50052 50053
+
+# Terminal 2 - Node 1 on port 50052
+./kv_server 1 50052 50051 50053
+
+# Terminal 3 - Node 2 on port 50053
+./kv_server 2 50053 50051 50052
 ```
 
-**Terminal 2** - Node 1 (port 50052)
-```bash
-./kv_server 1 50052 50051 50053 50054
-```
+Wait for leader election (~300ms), then interact via the client:
 
-**Terminal 3** - Node 2 (port 50053)
-```bash
-./kv_server 2 50053 50051 50052 50054
-```
-
-**Usage** via client:
 ```bash
 ./kv_client localhost:50051 set foo bar
-./kv_client localhost:50051 get foo
+./kv_client localhost:50051 get foo       
 ./kv_client localhost:50051 remove foo
+./kv_client localhost:50051 get foo        
 ```
 
-If the client redirects to a follower, use the leader hint address:
-```bash
-./kv_client <leader_hint_address> set key value
-```
+**Fault tolerance test** - kill one node and continue writing, the remaining two form a majority and keep making progress. Restart the killed node and it will catch up via log replication.
 
-## Design Choices
+---
 
-1. **gRPC for transport** - Bidirectional streaming support, strong typing via Protobuf
-2. **In-memory store** - Low-latency reads, WAL for persistence
-3. **Shared mutex** - Allows concurrent reads, blocks on writes
-4. **Randomized election timeouts** - Prevents election livelock
-5. **Log-structured recovery** - Simplifies WAL implementation, supports replay
+## Fault Tolerance Guarantees
+
+| Scenario | Behaviour |
+|----------|-----------|
+| Leader crashes | Followers detect missing heartbeat after election timeout, new leader elected within ~300ms |
+| Follower crashes | Cluster continues (majority still available in a 3-node setup), crashed follower receives missed log entries on rejoin |
+| Crash mid-write (before WAL fsync) | Write is lost, consistent with Raft, entry was never committed to a majority |
+| Crash mid-flush (SSTable partial write) | Partial SSTable discarded on recovery, WAL replays from last valid CRC32 entry |
+
+---
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|-----------|
+| Language | C++17 |
+| Consensus | Raft  |
+| Transport | gRPC 1.40+ |
+| Serialization | Protocol Buffers (Protobuf 3) |
+| Build system | CMake 3.14+ |
+| Storage | Custom LSM-Tree (WAL + MemTable + SSTables) |
+| Checksum | CRC32 (WAL entry validation) |
+
