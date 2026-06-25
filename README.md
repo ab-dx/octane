@@ -199,6 +199,8 @@ Octane is designed for high-throughput and low-latency, utilizing group commits 
 
 ### End to End load testing
 
+![Response Time Histogram](./assets/e2e_response_time.png)
+
 The entire cluster can be tested using [ghz](https://ghz.sh/), a gRPC benchmarking tool
 #### Setup:
 1. Install `ghz`
@@ -230,28 +232,6 @@ Summary:
   Fastest:      0.33 ms
   Average:      3.22 ms
   Requests/sec: 25014.84
-
-Response time histogram:
-  0.327  [1]    |
-  1.909  [982]  |∎∎∎∎∎∎∎
-  3.491  [5667] |∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎
-  5.074  [2698] |∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎
-  6.656  [486]  |∎∎∎
-  8.238  [109]  |∎
-  9.820  [46]   |
-  11.402 [7]    |
-  12.985 [2]    |
-  14.567 [1]    |
-  16.149 [1]    |
-
-Latency distribution:
-  10 % in 1.92 ms
-  25 % in 2.48 ms
-  50 % in 3.05 ms
-  75 % in 3.78 ms
-  90 % in 4.62 ms
-  95 % in 5.42 ms
-  99 % in 7.34 ms
 ```
 
 ---
