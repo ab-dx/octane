@@ -9,7 +9,22 @@ set(CMAKE_FIND_PACKAGE_PREFER_CONFIG TRUE)
 
 find_package(Threads REQUIRED)
 find_package(Protobuf REQUIRED)
-find_package(gRPC CONFIG REQUIRED)
+find_package(gRPC CONFIG QUIET)
+
+if(NOT gRPC_FOUND)
+    # Fallback for Ubuntu CI
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(GRPC_PKG REQUIRED grpc++)
+    find_program(GRPC_CPP_PLUGIN_EXE grpc_cpp_plugin REQUIRED)
+
+    add_library(gRPC::grpc++ INTERFACE IMPORTED)
+    target_link_directories(gRPC::grpc++ INTERFACE ${GRPC_PKG_LIBRARY_DIRS})
+    target_link_libraries(gRPC::grpc++ INTERFACE ${GRPC_PKG_LIBRARIES})
+    target_include_directories(gRPC::grpc++ INTERFACE ${GRPC_PKG_INCLUDE_DIRS})
+
+    add_executable(gRPC::grpc_cpp_plugin IMPORTED)
+    set_target_properties(gRPC::grpc_cpp_plugin PROPERTIES IMPORTED_LOCATION ${GRPC_CPP_PLUGIN_EXE})
+endif()
 
 set(PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
 set(PROTO_FILE "${PROTO_DIR}/raft.proto")
