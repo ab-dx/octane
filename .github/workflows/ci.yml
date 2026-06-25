@@ -1,0 +1,36 @@
+name: Octane CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          cmake \
+          build-essential \
+          libprotobuf-dev \
+          protobuf-compiler \
+          libgrpc++-dev \
+          protobuf-compiler-grpc
+
+    - name: Configure CMake
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build Octane
+      run: cmake --build ${{github.workspace}}/build --config Release -j $(nproc)
+
+    - name: Run Storage & Concurrency Benchmarks
+      working-directory: ${{github.workspace}}/build
+      run: ./octane_benchmarks
