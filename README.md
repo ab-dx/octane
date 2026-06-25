@@ -1,4 +1,4 @@
-# Octane
+<h1 align="center">Octane</h1>
 
 A fault-tolerant distributed key-value store built from scratch in C++17, implementing the Raft consensus algorithm over gRPC/Protobuf for inter-node communication, with an LSM-Tree storage engine and CRC32-validated Write-Ahead Log for crash resiliency.
 
@@ -190,6 +190,69 @@ Wait for leader election (~300ms), then interact via the client:
 | Follower crashes | Cluster continues (majority still available in a 3-node setup), crashed follower receives missed log entries on rejoin |
 | Crash mid-write (before WAL fsync) | Write is lost, consistent with Raft, entry was never committed to a majority |
 | Crash mid-flush (SSTable partial write) | Partial SSTable discarded on recovery, WAL replays from last valid CRC32 entry |
+
+---
+
+## Benchmarks
+
+Octane is designed for high-throughput and low-latency, utilizing group commits and network batching to decouple slow disk I/O and network broadcasts from the client's critical path.
+
+### End to End load testing
+
+The entire cluster can be tested using [ghz](https://ghz.sh/), a gRPC benchmarking tool
+#### Setup:
+1. Install `ghz`
+2. Start a cluster
+3. Target the leader node (here, sending 10,000 commands via 100 concurrent clients)
+
+```
+ghz --insecure \
+    --proto ./proto/raft.proto \
+    --call raftpb.RaftNode.SubmitCommand \
+    -d '{"command": "SET stress_key stress_value"}' \
+    -c 100 -n 10000 \
+    0.0.0.0:50051
+```
+
+#### Benchmarks:
+- Throughput: >25,000 req/sec
+- Average Latency: ~3.2ms
+- P99 Tail Latency: ~7.3ms
+- Success rate: 100% (no dropped connections)
+
+Performance may vary based on disk limitations and network latency between nodes
+
+```
+Summary:
+  Count:        10000
+  Total:        399.76 ms
+  Slowest:      16.15 ms
+  Fastest:      0.33 ms
+  Average:      3.22 ms
+  Requests/sec: 25014.84
+
+Response time histogram:
+  0.327  [1]    |
+  1.909  [982]  |∎∎∎∎∎∎∎
+  3.491  [5667] |∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎
+  5.074  [2698] |∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎
+  6.656  [486]  |∎∎∎
+  8.238  [109]  |∎
+  9.820  [46]   |
+  11.402 [7]    |
+  12.985 [2]    |
+  14.567 [1]    |
+  16.149 [1]    |
+
+Latency distribution:
+  10 % in 1.92 ms
+  25 % in 2.48 ms
+  50 % in 3.05 ms
+  75 % in 3.78 ms
+  90 % in 4.62 ms
+  95 % in 5.42 ms
+  99 % in 7.34 ms
+```
 
 ---
 
