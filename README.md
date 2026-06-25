@@ -234,6 +234,18 @@ Summary:
   Requests/sec: 25014.84
 ```
 
+### Unit Testing
+
+```
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/octane_benchmarks
+```
+- `IsolatedKVStoreFixture/SequentialWrites`: Measures raw append speed to the MemTable and WAL. (Performance: ~305,000 writes/sec)
+- `SharedKVStoreFixture/ConcurrentReads`: Tests in-memory map lookup speed and measures std::shared_mutex lock contention across 1, 4, and 8 threads. (Performance: ~16 nanoseconds per read)
+- `StorageFixture/WalAppendBatch`: Verifies the Group Commit optimization.
+- `StorageFixture/SSTableFlush`: Measures the cost of serializing a 4MB MemTable to an immutable SSTable on disk.
+
 ---
 
 ## Tech Stack

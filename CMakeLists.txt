@@ -48,3 +48,21 @@ target_link_libraries(kv_server PRIVATE kv_core)
 
 add_executable(kv_client src/client/client.cpp)
 target_link_libraries(kv_client PRIVATE raft_proto)
+
+include(FetchContent)
+FetchContent_Declare(
+  googlebenchmark
+  GIT_REPOSITORY https://github.com/google/benchmark.git
+  GIT_TAG        v1.8.3
+)
+set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "Disable benchmark testing" FORCE)
+FetchContent_MakeAvailable(googlebenchmark)
+
+add_executable(octane_benchmarks benchmarks/store_benchmark.cpp)
+
+target_link_libraries(octane_benchmarks PRIVATE 
+    kv_core 
+    Threads::Threads
+    benchmark::benchmark 
+    benchmark::benchmark_main
+)
