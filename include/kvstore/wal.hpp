@@ -5,6 +5,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace kvstore {
 
@@ -13,6 +14,13 @@ struct ValueRecord {
   std::string value;
   uint64_t seq_num;
   bool is_tombstone; // mark deletions
+};
+
+struct BatchEntry {
+  uint8_t op_type;
+  std::string key;
+  std::string value;
+  uint64_t seq_num;
 };
 
 using MemTable = std::map<std::string, ValueRecord>;
@@ -29,6 +37,8 @@ public:
   // append operations to the log
   void append(uint8_t op_type, const std::string &key, const std::string &value,
               uint64_t seq_num);
+  // append entries in batches
+  void append_batch(const std::vector<BatchEntry> &batch);
 
   // log rotations
   void rotate_log(uint64_t new_log_id);

@@ -34,6 +34,10 @@ public:
   // delete a key
   bool remove(const std::string &key);
 
+  // apply operations in batch
+  void apply_batch(
+      const std::vector<std::tuple<uint8_t, std::string, std::string>> &ops);
+
   void set_flush_callback(std::function<void()> callback) {
     on_flush_callback_ = std::move(callback);
   }

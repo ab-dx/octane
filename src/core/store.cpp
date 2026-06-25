@@ -95,6 +95,33 @@ bool KVStore::remove(const std::string &key) {
   return true;
 }
 
+void KVStore::apply_batch(
+    const std::vector<std::tuple<uint8_t, std::string, std::string>> &ops) {
+  std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+  std::vector<BatchEntry> wal_batch;
+
+  for (const auto &op : ops) {
+    uint64_t seq = ++sequence_number_;
+    uint8_t op_type = std::get<0>(op);
+    std::string key = std::get<1>(op);
+    std::string value = std::get<2>(op);
+
+    wal_batch.push_back({op_type, key, value, seq});
+
+    if (op_type == 0) { // SET
+      memtable_[key] = ValueRecord{value, seq, false};
+      estimated_memtable_size_ += key.size() + value.size() + 16;
+    } else { // REMOVE
+      memtable_[key] = ValueRecord{"", seq, true};
+      estimated_memtable_size_ += key.size() + 16;
+    }
+  }
+
+  // push to disk in single operation
+  wal_->append_batch(wal_batch);
+  check_and_flush();
+}
+
 void KVStore::check_and_flush() {
   if (estimated_memtable_size_ >= MEMTABLE_FLUSH_THRESHOLD) {
     flush_memtable_to_sstable();

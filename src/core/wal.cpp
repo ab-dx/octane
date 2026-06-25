@@ -106,6 +106,41 @@ void WriteAheadLog::append(uint8_t op_type, const std::string &key,
   file_.flush(); // TODO: optimize with group commit
 }
 
+void WriteAheadLog::append_batch(const std::vector<BatchEntry> &batch) {
+  std::lock_guard<std::mutex> lock(log_mutex_);
+
+  for (const auto &req : batch) {
+    WALRecordHeader header;
+    header.op_type = req.op_type;
+    header.seq_num = req.seq_num;
+    header.key_len = static_cast<uint32_t>(req.key.size());
+    header.val_len = static_cast<uint32_t>(req.value.size());
+
+    // compute crc32
+    uint32_t crc =
+        calculate_crc32(reinterpret_cast<const uint8_t *>(&header.op_type),
+                        sizeof(header.op_type));
+    crc = calculate_crc32(reinterpret_cast<const uint8_t *>(&header.seq_num),
+                          sizeof(header.seq_num), crc);
+    crc = calculate_crc32(reinterpret_cast<const uint8_t *>(req.key.data()),
+                          req.key.size(), crc);
+    if (header.val_len > 0) {
+      crc = calculate_crc32(reinterpret_cast<const uint8_t *>(req.value.data()),
+                            req.value.size(), crc);
+    }
+    header.crc32 = crc;
+
+    // write to buffer
+    file_.write(reinterpret_cast<const char *>(&header), sizeof(header));
+    file_.write(req.key.data(), req.key.size());
+    if (header.val_len > 0)
+      file_.write(req.value.data(), req.value.size());
+  }
+
+  // single physical flush for entire batch
+  file_.flush();
+}
+
 void WriteAheadLog::recover(MemTable &memtable) {
   // TODO: loop over all .wal files
   std::string path = get_log_filepath(current_log_id_);

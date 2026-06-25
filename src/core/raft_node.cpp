@@ -28,10 +28,17 @@ RaftNode::RaftNode(KVStore &store, int my_id,
 
   last_heartbeat_ = std::chrono::steady_clock::now();
   background_thread_ = std::thread(&RaftNode::ElectionLoop, this);
+  applier_thread_ = std::thread(&RaftNode::ApplierLoop, this);
 }
 
 RaftNode::~RaftNode() {
   running_ = false;
+
+  // shutdown applier workers
+  applier_cv_.notify_all();
+  if (applier_thread_.joinable())
+    applier_thread_.join();
+
   // shutdown completion queue
   cq_.Shutdown();
   if (cq_thread_.joinable())
@@ -163,12 +170,16 @@ void RaftNode::SendHeartbeats() {
     int prev_log_index = peer_next_idx - 1;
     int prev_log_term = GetTerm(prev_log_index);
 
+    // limit to 1000 entries per RPC
+    size_t end_idx =
+        std::min(log_.size(), static_cast<size_t>(peer_next_idx + 1000));
+
     call->request.set_prevlogindex(prev_log_index);
     call->request.set_prevlogterm(prev_log_term);
 
     int local_start_idx = peer_next_idx - last_included_index_ - 1;
     local_start_idx = std::max(0, local_start_idx);
-    for (size_t i = peer_next_idx; i < log_.size(); ++i) {
+    for (size_t i = peer_next_idx; i < end_idx; ++i) {
       *call->request.add_entries() = log_[i];
     }
 
@@ -351,7 +362,7 @@ grpc::Status RaftNode::SubmitCommand(grpc::ServerContext *context,
   std::cout << "\n[Client] Received Command: '" << request->command()
             << "' | Appended to Raft Log at index " << entry_index << "\n";
 
-  SendHeartbeats();
+  // SendHeartbeats();
 
   reply->set_success(true);
 
@@ -359,28 +370,59 @@ grpc::Status RaftNode::SubmitCommand(grpc::ServerContext *context,
 }
 
 void RaftNode::ApplyCommittedEntries() {
-  // if commit index has moved forward, apply all unapplied entries
-  while (last_applied_ < commit_index_) {
-    last_applied_++;
-    const auto &entry = log_[last_applied_];
+  bool pushed = false;
+  {
+    std::lock_guard<std::mutex> lock(applier_mutex_);
+    while (last_applied_ < commit_index_) {
+      last_applied_++;
+      const auto &entry = log_[last_applied_];
+      std::string cmd = entry.command();
 
-    std::string cmd = entry.command();
-    if (cmd.rfind("SET ", 0) == 0) {
-      size_t space1 = cmd.find(' ');
-      size_t space2 = cmd.find(' ', space1 + 1);
-      if (space1 != std::string::npos && space2 != std::string::npos) {
-        std::string key = cmd.substr(space1 + 1, space2 - space1 - 1);
-        std::string val = cmd.substr(space2 + 1);
-
-        store_.set(key, val);
-        std::cout << "\n[Store] Committed to Disk: " << key << " = " << val
-                  << "\n";
+      if (cmd.rfind("SET ", 0) == 0) {
+        size_t space1 = cmd.find(' ');
+        size_t space2 = cmd.find(' ', space1 + 1);
+        if (space1 != std::string::npos && space2 != std::string::npos) {
+          applier_queue_.push_back({0,
+                                    cmd.substr(space1 + 1, space2 - space1 - 1),
+                                    cmd.substr(space2 + 1)});
+          pushed = true;
+        }
+      } else if (cmd.rfind("DEL", 0) == 0) {
+        applier_queue_.push_back({1, cmd.substr(4), ""});
+        pushed = true;
       }
-    } else if (cmd.rfind("DEL", 0) == 0) {
-      std::string key = cmd.substr(4); // skip "DEL "
-      store_.remove(key);
-      std::cout << "[Store] Deleted from Disk: " << key << "\n";
     }
+  }
+  if (pushed)
+    applier_cv_.notify_one();
+}
+
+void RaftNode::ApplierLoop() {
+  while (running_) {
+    std::vector<ApplierTask> batch;
+
+    {
+      std::unique_lock<std::mutex> lock(applier_mutex_);
+      applier_cv_.wait(
+          lock, [this]() { return !applier_queue_.empty() || !running_; });
+      if (!running_ && applier_queue_.empty())
+        break;
+
+      std::swap(batch, applier_queue_);
+    }
+
+    if (batch.empty())
+      continue;
+
+    // format for KVStore
+    std::vector<std::tuple<uint8_t, std::string, std::string>> ops;
+    ops.reserve(batch.size());
+    for (const auto &task : batch) {
+      ops.push_back({task.op_type, task.key, task.val});
+    }
+
+    // write to disk
+    store_.apply_batch(ops);
   }
 }
 

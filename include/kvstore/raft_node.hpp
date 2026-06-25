@@ -4,9 +4,11 @@
 #include "raft.grpc.pb.h"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <grpcpp/grpcpp.h>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <random>
 #include <string>
 #include <thread>
@@ -98,6 +100,19 @@ private:
 
   grpc::CompletionQueue cq_; // job queue for async tasks
   std::thread cq_thread_;
+
+  struct ApplierTask {
+    uint8_t op_type;
+    std::string key;
+    std::string val;
+  };
+
+  std::vector<ApplierTask> applier_queue_;
+  std::mutex applier_mutex_;
+  std::condition_variable applier_cv_;
+  std::thread applier_thread_;
+
+  void ApplierLoop();
 
   // rpc registry
   uint64_t next_rpc_id_ = 0;
