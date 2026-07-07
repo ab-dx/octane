@@ -67,68 +67,86 @@ std::optional<std::string> KVStore::get(const std::string &key) const {
 }
 
 void KVStore::set(const std::string &key, const std::string &value) {
-  uint64_t seq = ++sequence_number_;
+  bool flushed = false;
+  {
+    uint64_t seq = ++sequence_number_;
 
-  std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
 
-  wal_->append(0, key, value, seq);
+    wal_->append(0, key, value, seq);
 
-  memtable_[key] = ValueRecord{value, seq, false};
-  estimated_memtable_size_ += key.size() + value.size() + 16;
+    memtable_[key] = ValueRecord{value, seq, false};
+    estimated_memtable_size_ += key.size() + value.size() + 16;
 
-  check_and_flush();
+    flushed = check_and_flush();
+  }
+  if (flushed && on_flush_callback_) {
+    on_flush_callback_();
+  }
 }
 
 bool KVStore::remove(const std::string &key) {
-  uint64_t seq = ++sequence_number_;
+  bool flushed = false;
+  {
+    uint64_t seq = ++sequence_number_;
 
-  std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
 
-  wal_->append(1, key, "", seq);
+    wal_->append(1, key, "", seq);
 
-  // set as tombstone
-  memtable_[key] = ValueRecord{"", seq, true};
-  estimated_memtable_size_ += key.size() + 16;
+    // set as tombstone
+    memtable_[key] = ValueRecord{"", seq, true};
+    estimated_memtable_size_ += key.size() + 16;
 
-  check_and_flush();
-
+    flushed = check_and_flush();
+  }
+  if (flushed && on_flush_callback_) {
+    on_flush_callback_();
+  }
   return true;
 }
 
 void KVStore::apply_batch(
     const std::vector<std::tuple<uint8_t, std::string, std::string>> &ops) {
-  std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-  std::vector<BatchEntry> wal_batch;
+  bool flushed = false;
+  {
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    std::vector<BatchEntry> wal_batch;
 
-  for (const auto &op : ops) {
-    uint64_t seq = ++sequence_number_;
-    uint8_t op_type = std::get<0>(op);
-    std::string key = std::get<1>(op);
-    std::string value = std::get<2>(op);
+    for (const auto &op : ops) {
+      uint64_t seq = ++sequence_number_;
+      uint8_t op_type = std::get<0>(op);
+      std::string key = std::get<1>(op);
+      std::string value = std::get<2>(op);
 
-    wal_batch.push_back({op_type, key, value, seq});
+      wal_batch.push_back({op_type, key, value, seq});
 
-    if (op_type == 0) { // SET
-      memtable_[key] = ValueRecord{value, seq, false};
-      estimated_memtable_size_ += key.size() + value.size() + 16;
-    } else { // REMOVE
-      memtable_[key] = ValueRecord{"", seq, true};
-      estimated_memtable_size_ += key.size() + 16;
+      if (op_type == 0) { // SET
+        memtable_[key] = ValueRecord{value, seq, false};
+        estimated_memtable_size_ += key.size() + value.size() + 16;
+      } else { // REMOVE
+        memtable_[key] = ValueRecord{"", seq, true};
+        estimated_memtable_size_ += key.size() + 16;
+      }
     }
-  }
 
-  // push to disk in single operation
-  wal_->append_batch(wal_batch);
-  check_and_flush();
+    // push to disk in single operation
+    wal_->append_batch(wal_batch);
+    flushed = check_and_flush();
+  }
+  if (flushed && on_flush_callback_) {
+    on_flush_callback_();
+  }
 }
 
-void KVStore::check_and_flush() {
+bool KVStore::check_and_flush() {
   if (estimated_memtable_size_ >= MEMTABLE_FLUSH_THRESHOLD) {
-    flush_memtable_to_sstable();
+    return flush_memtable_to_sstable();
   }
+  return false;
 }
 
-void KVStore::flush_memtable_to_sstable() {
+bool KVStore::flush_memtable_to_sstable() {
   std::cout << "\n[KVStore] MemTable size (" << estimated_memtable_size_
             << " bytes) reached threshold. Initiating flush to SSTable...\n";
 
@@ -137,6 +155,7 @@ void KVStore::flush_memtable_to_sstable() {
 
   SSTableWriter writer(sst_filename);
   writer.write_memtable(memtable_);
+  sstables_.push_back(std::make_unique<SSTableReader>(sst_filename));
 
   // clear the active MemTable
   memtable_.clear();
@@ -148,9 +167,10 @@ void KVStore::flush_memtable_to_sstable() {
 
   std::cout << "[KVStore] Flush complete. WAL rotated to log ID "
             << current_log_id_ << "\n";
-  if (on_flush_callback_) {
-    on_flush_callback_();
-  }
+  return true;
+  // if (on_flush_callback_) {
+  //   on_flush_callback_();
+  // }
 }
 
 struct MergeComparator {

@@ -43,8 +43,8 @@ public:
   }
 
 private:
-  void check_and_flush();
-  void flush_memtable_to_sstable();
+  bool check_and_flush();
+  bool flush_memtable_to_sstable();
 
   std::vector<std::string> get_all_sstable_filepaths() const;
   void perform_major_compaction();
